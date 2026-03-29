@@ -23,3 +23,19 @@ python arena.py mcts-2k mcts-1k 20
 python arena.py mcts-5k mcts-1k 10
 [8-2-0]  284.9s
 ```
+
+
+```
+python arena.py tournament -n 20 random mcts-1k mcts-2k mcts-5k
+
+python arena.py ratings
+
+────────────────────────────────────────────────────
+  Rank  Agent           Rating     RD  Games
+────────────────────────────────────────────────────
+     1  mcts-5k         1832.1  125.2     15
+     2  mcts-2k         1590.6  125.2     15
+     3  mcts-1k         1530.2  125.2     15
+     4  random          1047.1  125.2     15
+────────────────────────────────────────────────────
+```
