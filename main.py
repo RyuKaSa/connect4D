@@ -17,7 +17,7 @@ from agents import HumanAgent, AGENT_FACTORIES
 import random as _random
 import math as _math
 
-app = Ursina(title="Connect Four 3D", borderless=False)
+app = Ursina(title="Connect Four D", borderless=False)
 window.color = Color(0.2, 0.2, 0.2, 1)
 
 # ── Constants ──────────────────────────────────────────────
