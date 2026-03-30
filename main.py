@@ -14,6 +14,8 @@ Connect Four 3D — Ursina renderer with agent selection.
 from ursina import *
 from engine import Game, GRID
 from agents import HumanAgent, AGENT_FACTORIES
+import random as _random
+import math as _math
 
 app = Ursina(title="Connect Four 3D", borderless=False)
 window.color = Color(0.2, 0.2, 0.2, 1)
@@ -70,6 +72,40 @@ def piece_y(level):
 def player_label(p):
     return f"P{p+1} ({'White' if p == 0 else 'Black'})"
 
+# ── Position evaluation (random rollouts) ─────────────────
+EVAL_ROLLOUTS = 300
+
+def evaluate_position(g: Game, n: int = EVAL_ROLLOUTS) -> float:
+    """Return win probability for player 0 (White) via random rollouts."""
+    if g.is_over():
+        if g.result == 0:
+            return 1.0
+        if g.result == 1:
+            return 0.0
+        return 0.5  # draw
+    wins = 0.0
+    for _ in range(n):
+        sim = g.copy()
+        while not sim.is_over():
+            sim.place(_random.choice(sim.legal_pegs()))
+        if sim.result == 0:
+            wins += 1.0
+        elif sim.result == "draw":
+            wins += 0.5
+    return wins / n
+
+def update_eval():
+    """Recompute eval and update the HUD bar + text."""
+    p = evaluate_position(game)
+    p_clamped = max(0.005, min(0.995, p))
+    advantage = 400 * _math.log10(p_clamped / (1 - p_clamped))
+    # Update bar width (white portion)
+    eval_white_bar.scale_x = max(0.002, 0.22 * p)
+    eval_white_bar.x = -0.85 + eval_white_bar.scale_x / 2
+    # Update text
+    sign = "+" if advantage >= 0 else ""
+    eval_label.text = f"eval: {sign}{advantage:.0f}  (W:{p * 100:.0f}% B:{(1 - p) * 100:.0f}%)"
+
 # ── Actions ────────────────────────────────────────────────
 def do_place(pid):
     if game.is_over():
@@ -97,6 +133,7 @@ def do_place(pid):
             show_game_over(f"{player_label(game.result)} wins!")
     else:
         info_text.text = f"turn: {player_label(game.turn)}"
+    update_eval()
     return True
 
 def do_undo():
@@ -109,6 +146,7 @@ def do_undo():
     hide_game_over()
     info_text.text = f"undo → turn: {player_label(game.turn)}"
     ai_timer[0] = 0.0
+    update_eval()
 
 def do_reset():
     game.reset()
@@ -119,6 +157,7 @@ def do_reset():
     hide_game_over()
     info_text.text = f"reset | turn: {player_label(game.turn)}"
     ai_timer[0] = 0.0
+    update_eval()
 
 # ── Game over overlay ─────────────────────────────────────
 game_over_bg = Entity(
@@ -210,6 +249,27 @@ p2_btn.on_click = lambda: cycle_agent(1)
 def _update_agent_buttons():
     p1_btn.text = f"P1: {agents[0].name}"
     p2_btn.text = f"P2: {agents[1].name}"
+
+# ── Eval bar ───────────────────────────────────────────────
+eval_bg_bar = Entity(
+    parent=camera.ui, model="quad",
+    color=Color(0.15, 0.15, 0.15, 0.9),
+    scale=(0.22, 0.012),
+    position=(-0.74, -0.525),
+)
+eval_white_bar = Entity(
+    parent=camera.ui, model="quad",
+    color=Color(0.9, 0.9, 0.9, 0.9),
+    scale=(0.11, 0.012),
+    position=(-0.85 + 0.055, -0.525),
+    z=-0.1,
+)
+eval_label = Text(
+    text="eval: +0  (W:50% B:50%)",
+    position=(-0.85, -0.55),
+    scale=0.8,
+    background=True,
+)
 
 # ── Hover highlight ────────────────────────────────────────
 highlight = Entity(

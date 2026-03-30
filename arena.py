@@ -185,6 +185,13 @@ AGENT_REGISTRY: dict[str, callable] = {
     "mcts-5k":  lambda: MCTSAgent(5000),
 }
 
+# Add neural agent if model file exists
+from pathlib import Path as _Path
+_NEURAL_MODEL = _Path(__file__).parent / "neural_model.pt"
+if _NEURAL_MODEL.exists():
+    from agents import NeuralAgent
+    AGENT_REGISTRY["neural"] = lambda: NeuralAgent(str(_NEURAL_MODEL))
+
 
 def _resolve(name: str):
     key = name.lower()

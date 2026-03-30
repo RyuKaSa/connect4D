@@ -141,7 +141,119 @@ class _Node:
         self.untried = list(legal_moves)
 
 
+# ── Neural network utilities ──────────────────────────────
+
+from engine import Board
+
+def board_to_features(board: Board) -> list[float]:
+    """Convert board to 128 binary features from the current player's perspective.
+
+    Channel 0 (bits 0..63):  current player's pieces
+    Channel 1 (bits 64..127): opponent's pieces
+
+    This canonical encoding means the network always sees "my pieces" vs
+    "their pieces" regardless of which color is to move.
+    """
+    current = board.turn
+    opponent = 1 - current
+    features = []
+    for i in range(64):
+        features.append(1.0 if board.bbs[current] & (1 << i) else 0.0)
+    for i in range(64):
+        features.append(1.0 if board.bbs[opponent] & (1 << i) else 0.0)
+    return features
+
+
+# Lazy torch import — only loaded when a NeuralAgent is actually instantiated.
+_torch = None
+
+def _get_torch():
+    global _torch
+    if _torch is None:
+        import torch
+        _torch = torch
+    return _torch
+
+
+class ConnectFourNet:
+    """MLP with dropout: 128 → 256 → 256 → 16 (peg logits).
+
+    Defined without inheriting torch.nn.Module at import time so that
+    agents.py can be imported without PyTorch installed (for headless
+    use with non-neural agents).  The actual Module is built in __init__.
+    """
+
+    def __init__(self, hidden: int = 256, dropout: float = 0.3):
+        torch = _get_torch()
+        self._model = torch.nn.Sequential(
+            torch.nn.Linear(128, hidden),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden, hidden),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden, 16),
+        )
+
+    def __call__(self, x):
+        return self._model(x)
+
+    def parameters(self):
+        return self._model.parameters()
+
+    def state_dict(self):
+        return self._model.state_dict()
+
+    def load_state_dict(self, sd):
+        return self._model.load_state_dict(sd)
+
+    def train(self, mode=True):
+        self._model.train(mode)
+        return self
+
+    def eval(self):
+        self._model.eval()
+        return self
+
+
+# ── Neural Agent ───────────────────────────────────────────
+
+class NeuralAgent:
+    """Policy network agent.  Loads a trained ConnectFourNet and picks
+    the highest-scoring legal peg.  Falls back to random if no model found."""
+
+    def __init__(self, model_path: str = "neural_model.pt") -> None:
+        torch = _get_torch()
+        self.name = "Neural"
+        self._torch = torch
+        self.model = ConnectFourNet()
+        self.model.load_state_dict(
+            torch.load(model_path, map_location="cpu", weights_only=True)
+        )
+        self.model.eval()
+
+    def choose_move(self, game: Game) -> int:
+        torch = self._torch
+        features = board_to_features(game.board)
+        with torch.no_grad():
+            logits = self.model(torch.tensor([features], dtype=torch.float32))
+        logits = logits.squeeze(0)
+
+        # Mask illegal moves to -inf
+        legal = game.legal_pegs()
+        mask = torch.full((16,), float("-inf"))
+        for p in legal:
+            mask[p] = 0.0
+        logits = logits + mask
+
+        return logits.argmax().item()
+
+
 # ── Registry (used by the UI to cycle through agents) ─────
+
+from pathlib import Path as _Path
+
+_NEURAL_MODEL = _Path(__file__).parent / "neural_model.pt"
 
 AGENT_FACTORIES: list[tuple[str, callable]] = [
     ("Human",     lambda: HumanAgent()),
@@ -149,3 +261,8 @@ AGENT_FACTORIES: list[tuple[str, callable]] = [
     ("MCTS-1k",   lambda: MCTSAgent(1000)),
     ("MCTS-5k",   lambda: MCTSAgent(5000)),
 ]
+
+if _NEURAL_MODEL.exists():
+    AGENT_FACTORIES.append(
+        ("Neural", lambda: NeuralAgent(str(_NEURAL_MODEL)))
+    )
