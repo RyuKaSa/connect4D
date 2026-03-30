@@ -85,7 +85,7 @@ python arena.py tournament [-n N] [agent1 agent2 ...]
 python arena.py ratings
 ```
 
-Available agents: `random`, `mcts-1k`, `mcts-2k`, `mcts-5k`, `neural` (if model trained)
+Available agents: `random`, `mcts-1k`, `mcts-2k`, `mcts-5k`, `neural` (if trained), `neural-v2` (if trained)
 
 Examples:
 
@@ -133,15 +133,22 @@ python test_engine.py
 | MCTS-1k | UCT, 1000 iterations, random rollouts | ~100ms/move |
 | MCTS-5k | UCT, 5000 iterations, random rollouts | ~500ms/move |
 | Neural | MLP policy network (128→256→256→16), trained via DAgger + RL | ~0.1ms/move |
+| NeuralV2 | 3D CNN policy network (2×4×4×4 input, Conv3d), trained via DAgger + RL | ~0.5ms/move |
 
 MCTS uses Upper Confidence bounds for Trees (UCB1) with exploration constant c=√2.
 No heuristic evaluation — pure win/loss/draw signal from terminal states.
 Move selection: most-visited child (robust selection).
 
-The neural agent uses a canonical board encoding (128 binary features: current
-player's pieces + opponent's pieces) so it learns to play from either side.
-At inference time it does a single forward pass and picks the highest-scoring
-legal peg — ~1000x faster than MCTS-5k.
+The neural agents use a canonical board encoding (128 binary features: current
+player's pieces + opponent's pieces) so they learn to play from either side.
+
+**Neural (v1, MLP)**: flat MLP with dropout. Fast but has no spatial awareness —
+sees the board as a bag of bits. Reaches ~MCTS-300 strength.
+
+**NeuralV2 (3D CNN)**: treats the board as its natural 2×4×4×4 tensor. Three
+Conv3d layers (32→64→128 channels) with batch normalization learn spatial
+patterns (lines, forks, threats) that the MLP cannot. Global average pooling
+feeds into a small FC head.
 
 ## Benchmark results
 
@@ -150,6 +157,19 @@ Random vs Random    (100k games):  55.2%-44.8%-0.005%  — first-player edge
 MCTS-1k vs Random    (100 games):  100-0-0             — total domination
 MCTS-2k vs MCTS-1k   (20 games):   13-7-0             — more iterations = stronger
 MCTS-5k vs MCTS-1k   (10 games):    8-2-0             — scaling holds
+Neural vs Random      (50 games):   50-0-0             — 50 games in 0.1s
+Neural vs MCTS-1k     (50 games):   16-34-0            — ~MCTS-300 equivalent
+```
+
+Current leaderboard:
+
+```
+Rank  Agent           Rating     RD  Games
+   1  mcts-5k         1832.1  125.2     15
+   2  mcts-2k         1723.3   57.5     75
+   3  mcts-1k         1538.1   56.4     75
+   4  neural          1415.4   55.2     60
+   5  random           899.8   77.5     75
 ```
 
 ## Glicko-2 ratings
@@ -176,66 +196,93 @@ Key parameters (in `glicko2.py`):
 
 ## Neural agent training pipeline
 
-Three-stage pipeline to train a fast neural agent that matches or exceeds MCTS-5k.
+Three-stage pipeline to train neural agents. Supports two architectures:
+- `--arch mlp` (v1, default) — flat MLP, saves to `neural_model.pt`
+- `--arch cnn` (v2) — 3D CNN, saves to `neural_v2_model.pt`
+
+Both use the same training data and pipeline. The `--arch` flag goes
+before the stage subcommand.
 
 ### Stage 1: Generate expert data
 
 ```bash
-# Run MCTS-5k self-play, saving (state, move, result) triples
-python generate_data.py --games 2000 --iters 5000 --output training_data.npz
+# Run MCTS self-play, saving (state, move, result) triples
+python generate_data.py --games 1000 --iters 1000 --output training_data.npz
 ```
 
-Each game produces ~30 training examples (one per move). 2000 games ≈ 60k samples.
-This is a one-time offline job — expect ~2–4 hours with MCTS-5k.
+Each game produces ~30 training examples (one per move). 1000 games ≈ 30k samples.
+D4 symmetry augmentation expands this 8x during training (~240k effective samples).
 
 ### Stage 2: Behavioral cloning
 
 ```bash
-# Train the MLP to imitate MCTS moves
-python train_neural.py bc --data training_data.npz --epochs 50
-```
+# Train MLP (v1)
+python train_neural.py bc --data training_data.npz --epochs 100
 
-This produces `neural_model.pt`. The network should reach ~40–60% top-1 accuracy
-on MCTS moves (lower than you'd expect because many positions have multiple
-strong moves — matching the exact MCTS choice isn't necessary).
+# Train 3D CNN (v2)
+python train_neural.py --arch cnn bc --data training_data.npz --epochs 100
+```
 
 ### Stage 3: DAgger (distribution correction)
 
 ```bash
-# Play with learned policy, relabel with MCTS expert, retrain
-python train_neural.py dagger --model neural_model.pt --rounds 3 --games 200
+# MLP
+python train_neural.py dagger --rounds 2 --games 100
+
+# 3D CNN
+python train_neural.py --arch cnn dagger --rounds 2 --games 100
 ```
 
-DAgger fixes distribution shift: the states the learned policy visits differ
-from the states MCTS visits during self-play. Each round plays games with the
-current policy, queries MCTS for the "correct" move at each visited state,
-aggregates into the training set, and retrains. 2–3 rounds usually suffice.
-
-### Stage 4: RL fine-tuning (optional, for pushing past MCTS-5k)
+### Stage 4: RL fine-tuning (curriculum learning)
 
 ```bash
-# REINFORCE against MCTS-5k opponent
-python train_neural.py rl --model neural_model.pt --games 500 --iters 5000
+# MLP
+python train_neural.py rl --games 1000
+
+# 3D CNN
+python train_neural.py --arch cnn rl --games 1000
 ```
 
-Plays games against MCTS-5k using the learned policy, updates via policy
-gradient with +1/-1 reward. This is where the agent can surpass its teacher.
+RL uses curriculum learning: starts against MCTS-50, advances to stronger
+opponents as rolling win rate exceeds the threshold for each level. This
+prevents policy collapse from training against an opponent that's too strong.
+
+Features: baseline subtraction (reduces gradient variance), gradient clipping,
+best-model checkpointing (only saves when rolling win rate improves), automatic
+rollback if RL doesn't help.
+
+The pre-RL model is backed up to `*_pre_rl.pt` in case you want to restart
+RL with different hyperparameters.
 
 ### Evaluate
 
 ```bash
 # Head-to-head
-python arena.py neural mcts-5k 50
+python arena.py neural-v2 mcts-5k 50
 
-# Add to tournament
-python arena.py tournament -n 20 random mcts-1k mcts-5k neural
+# Full tournament
+python arena.py tournament -n 20 random neural neural-v2 mcts-1k mcts-2k
+```
+
+```
+────────────────────────────────────────────────────
+  Rank  Agent           Rating     RD  Games
+────────────────────────────────────────────────────
+     1  mcts-5k         1895.6   50.0    115
+     2  mcts-2k         1709.1   37.9    175
+     3  mcts-1k         1610.1   36.7    175
+     4  neural          1483.6   37.9    160
+     5  neural-v2       1230.3   43.9    100
+     6  random           828.5   63.9    175
+────────────────────────────────────────────────────
 ```
 
 ## Roadmap
 
 - [x] Glicko-2 rating system
 - [x] Live position eval bar
-- [x] Neural agent pipeline (DAgger + RL)
+- [x] Neural agent v1 (MLP, DAgger + RL) — ~1415 ELO
+- [x] Neural agent v2 (3D CNN, DAgger + RL)
 - [ ] AlphaZero agent (value+policy heads, MCTS-guided training)
 - [ ] Heuristic-enhanced MCTS (threat counting, center bias)
 - [ ] Arena tournament mode: incremental (add new agent, play vs existing)

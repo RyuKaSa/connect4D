@@ -216,11 +216,11 @@ class ConnectFourNet:
         return self
 
 
-# ── Neural Agent ───────────────────────────────────────────
+# ── Neural Agent (MLP, v1) ────────────────────────────────
 
 class NeuralAgent:
-    """Policy network agent.  Loads a trained ConnectFourNet and picks
-    the highest-scoring legal peg.  Falls back to random if no model found."""
+    """Policy network agent (MLP).  Loads a trained ConnectFourNet and picks
+    the highest-scoring legal peg."""
 
     def __init__(self, model_path: str = "neural_model.pt") -> None:
         torch = _get_torch()
@@ -239,7 +239,6 @@ class NeuralAgent:
             logits = self.model(torch.tensor([features], dtype=torch.float32))
         logits = logits.squeeze(0)
 
-        # Mask illegal moves to -inf
         legal = game.legal_pegs()
         mask = torch.full((16,), float("-inf"))
         for p in legal:
@@ -249,11 +248,133 @@ class NeuralAgent:
         return logits.argmax().item()
 
 
+# ── 3D CNN architecture (v2) ─────────────────────────────
+
+class ConnectFourCNN:
+    """3D CNN that treats the board as its natural shape: 2×4×4×4.
+
+    Channel 0: current player's pieces
+    Channel 1: opponent's pieces
+
+    Architecture:
+        Conv3d(2, 32, 3, pad=1) → BN → ReLU
+        Conv3d(32, 64, 3, pad=1) → BN → ReLU
+        Conv3d(64, 128, 3, pad=1) → BN → ReLU
+        GlobalAvgPool → 128
+        FC(128, 64) → ReLU → Dropout
+        FC(64, 16)
+
+    Input: flat 128 features (reshaped internally to 2×4×4×4).
+    Output: 16 peg logits.
+    """
+
+    def __init__(self, dropout: float = 0.3):
+        torch = _get_torch()
+        nn = torch.nn
+
+        self._conv = nn.Sequential(
+            nn.Conv3d(2, 32, kernel_size=3, padding=1),
+            nn.BatchNorm3d(32),
+            nn.ReLU(),
+            nn.Conv3d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm3d(64),
+            nn.ReLU(),
+            nn.Conv3d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm3d(128),
+            nn.ReLU(),
+        )
+        self._head = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 16),
+        )
+        # Combine into one module for state_dict / parameter iteration
+        self._model = nn.ModuleDict({
+            "conv": self._conv,
+            "head": self._head,
+        })
+
+    def __call__(self, x):
+        """x: (batch, 128) flat features → (batch, 16) peg logits."""
+        # Reshape: (B, 128) → (B, 2, 64) → (B, 2, 4, 4, 4)
+        # Bit layout: bit_index = x + 4*y + 16*z
+        # So reshaping (64,) as (4, 4, 4) gives [x, y, z] indexing
+        b = x.shape[0]
+        x = x.view(b, 2, 4, 4, 4)
+        x = self._conv(x)
+        # Global average pooling over spatial dims
+        x = x.mean(dim=[2, 3, 4])  # (B, 128)
+        return self._head(x)
+
+    def parameters(self):
+        return self._model.parameters()
+
+    def state_dict(self):
+        return self._model.state_dict()
+
+    def load_state_dict(self, sd):
+        return self._model.load_state_dict(sd)
+
+    def train(self, mode=True):
+        self._model.train(mode)
+        return self
+
+    def eval(self):
+        self._model.eval()
+        return self
+
+
+# ── Neural V2 Agent (3D CNN) ──────────────────────────────
+
+class NeuralV2Agent:
+    """Policy network agent (3D CNN).  Loads a trained ConnectFourCNN and picks
+    the highest-scoring legal peg."""
+
+    def __init__(self, model_path: str = "neural_v2_model.pt") -> None:
+        torch = _get_torch()
+        self.name = "NeuralV2"
+        self._torch = torch
+        self.model = ConnectFourCNN()
+        self.model.load_state_dict(
+            torch.load(model_path, map_location="cpu", weights_only=True)
+        )
+        self.model.eval()
+
+    def choose_move(self, game: Game) -> int:
+        torch = self._torch
+        features = board_to_features(game.board)
+        with torch.no_grad():
+            logits = self.model(torch.tensor([features], dtype=torch.float32))
+        logits = logits.squeeze(0)
+
+        legal = game.legal_pegs()
+        mask = torch.full((16,), float("-inf"))
+        for p in legal:
+            mask[p] = 0.0
+        logits = logits + mask
+
+        return logits.argmax().item()
+
+
+# ── Model factory (used by training scripts) ──────────────
+
+def make_model(arch: str = "mlp"):
+    """Create a model by architecture name."""
+    if arch == "mlp":
+        return ConnectFourNet()
+    elif arch == "cnn":
+        return ConnectFourCNN()
+    else:
+        raise ValueError(f"Unknown architecture: {arch!r}. Options: mlp, cnn")
+
+
 # ── Registry (used by the UI to cycle through agents) ─────
 
 from pathlib import Path as _Path
 
 _NEURAL_MODEL = _Path(__file__).parent / "neural_model.pt"
+_NEURAL_V2_MODEL = _Path(__file__).parent / "neural_v2_model.pt"
 
 AGENT_FACTORIES: list[tuple[str, callable]] = [
     ("Human",     lambda: HumanAgent()),
@@ -265,4 +386,9 @@ AGENT_FACTORIES: list[tuple[str, callable]] = [
 if _NEURAL_MODEL.exists():
     AGENT_FACTORIES.append(
         ("Neural", lambda: NeuralAgent(str(_NEURAL_MODEL)))
+    )
+
+if _NEURAL_V2_MODEL.exists():
+    AGENT_FACTORIES.append(
+        ("NeuralV2", lambda: NeuralV2Agent(str(_NEURAL_V2_MODEL)))
     )

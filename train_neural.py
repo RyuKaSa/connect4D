@@ -35,10 +35,13 @@ import torch.nn.functional as F
 from engine import Game
 from agents import (
     ConnectFourNet,
+    ConnectFourCNN,
     MCTSAgent,
     NeuralAgent,
+    NeuralV2Agent,
     RandomAgent,
     board_to_features,
+    make_model,
 )
 
 
@@ -188,10 +191,11 @@ def train_bc(
     epochs: int = 50,
     lr: float = 1e-3,
     val_split: float = 0.1,
+    arch: str = "mlp",
 ):
     """Train a policy network to imitate MCTS moves."""
     print(f"\n{'═' * 50}")
-    print(f"  BEHAVIORAL CLONING")
+    print(f"  BEHAVIORAL CLONING ({arch.upper()})")
     print(f"{'═' * 50}\n")
 
     data = np.load(data_path)
@@ -220,7 +224,7 @@ def train_bc(
     print(f"  Train: {len(train_states)} (augmented 8x from {len(train_idx)})")
     print(f"  Val: {len(val_states)} (un-augmented)")
 
-    model = ConnectFourNet()
+    model = make_model(arch)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     best_val_acc = 0.0
     t0 = time.perf_counter()
@@ -261,11 +265,12 @@ def run_dagger(
     mcts_iters: int = 5000,
     epochs_per_round: int = 20,
     lr: float = 5e-4,
+    arch: str = "mlp",
 ):
     """DAgger: play with learned policy, relabel states with MCTS expert,
     aggregate into training set, retrain."""
     print(f"\n{'═' * 50}")
-    print(f"  DAGGER ({rounds} rounds, {games_per_round} games each)")
+    print(f"  DAGGER ({arch.upper()}, {rounds} rounds, {games_per_round} games each)")
     print(f"{'═' * 50}\n")
 
     # Load existing data
@@ -276,12 +281,13 @@ def run_dagger(
     print(f"  Starting with {len(all_states)} existing samples")
 
     expert = MCTSAgent(iterations=mcts_iters)
+    _LearnerClass = NeuralV2Agent if arch == "cnn" else NeuralAgent
 
     for round_idx in range(1, rounds + 1):
         print(f"\n  ── DAgger round {round_idx}/{rounds} ──")
 
         # Load current model as the rollout policy
-        learner = NeuralAgent(model_path)
+        learner = _LearnerClass(model_path)
         new_states = []
         new_moves = []
         new_results = []
@@ -358,7 +364,7 @@ def run_dagger(
         moves_t = torch.from_numpy(aug_m)
         print(f"  Training on {len(states_t)} samples (augmented 8x from {len(raw_s)})")
 
-        model = ConnectFourNet()
+        model = make_model(arch)
         model.load_state_dict(
             torch.load(model_path, map_location="cpu", weights_only=True)
         )
@@ -398,11 +404,12 @@ def train_rl(
     gamma: float = 1.0,
     eval_every: int = 25,
     window: int = 50,           # rolling window for win rate
+    arch: str = "mlp",
 ):
     """REINFORCE with curriculum: start against weak MCTS, ramp up as win rate
     improves. Saves best model checkpoint and rolls back on collapse."""
     print(f"\n{'═' * 56}")
-    print(f"  RL FINE-TUNING (REINFORCE, curriculum)")
+    print(f"  RL FINE-TUNING ({arch.upper()}, REINFORCE, curriculum)")
     print(f"{'═' * 56}\n")
 
     # Back up the pre-RL model so we can recover
@@ -410,7 +417,7 @@ def train_rl(
     shutil.copy2(model_path, backup_path)
     print(f"  Backed up pre-RL model to {backup_path}")
 
-    model = ConnectFourNet()
+    model = make_model(arch)
     model.load_state_dict(
         torch.load(model_path, map_location="cpu", weights_only=True)
     )
@@ -549,20 +556,24 @@ def train_rl(
 
 # ── CLI ────────────────────────────────────────────────────
 
+_DEFAULT_MODEL = {"mlp": "neural_model.pt", "cnn": "neural_v2_model.pt"}
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train neural Connect Four agent")
+    parser.add_argument("--arch", choices=["mlp", "cnn"], default="mlp",
+                        help="Network architecture: mlp (v1) or cnn (v2)")
     sub = parser.add_subparsers(dest="stage", required=True)
 
     # Behavioral cloning
     bc_parser = sub.add_parser("bc", help="Behavioral cloning from MCTS data")
     bc_parser.add_argument("--data", default="training_data.npz")
-    bc_parser.add_argument("--model", default="neural_model.pt")
+    bc_parser.add_argument("--model", default=None)
     bc_parser.add_argument("--epochs", type=int, default=50)
     bc_parser.add_argument("--lr", type=float, default=1e-3)
 
     # DAgger
     dag_parser = sub.add_parser("dagger", help="DAgger: iterative relabeling")
-    dag_parser.add_argument("--model", default="neural_model.pt")
+    dag_parser.add_argument("--model", default=None)
     dag_parser.add_argument("--data", default="training_data.npz")
     dag_parser.add_argument("--rounds", type=int, default=3)
     dag_parser.add_argument("--games", type=int, default=200)
@@ -572,7 +583,7 @@ if __name__ == "__main__":
 
     # RL
     rl_parser = sub.add_parser("rl", help="REINFORCE with curriculum learning")
-    rl_parser.add_argument("--model", default="neural_model.pt")
+    rl_parser.add_argument("--model", default=None)
     rl_parser.add_argument("--games", type=int, default=500)
     rl_parser.add_argument("--lr", type=float, default=1e-4)
     rl_parser.add_argument("--eval-every", type=int, default=25)
@@ -580,28 +591,34 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # Resolve model path: explicit --model wins, otherwise use arch default
+    model_path = args.model or _DEFAULT_MODEL[args.arch]
+
     if args.stage == "bc":
         train_bc(
             data_path=args.data,
-            model_path=args.model,
+            model_path=model_path,
             epochs=args.epochs,
             lr=args.lr,
+            arch=args.arch,
         )
     elif args.stage == "dagger":
         run_dagger(
-            model_path=args.model,
+            model_path=model_path,
             data_path=args.data,
             rounds=args.rounds,
             games_per_round=args.games,
             mcts_iters=args.iters,
             epochs_per_round=args.epochs,
             lr=args.lr,
+            arch=args.arch,
         )
     elif args.stage == "rl":
         train_rl(
-            model_path=args.model,
+            model_path=model_path,
             n_games=args.games,
             lr=args.lr,
             eval_every=args.eval_every,
             window=args.window,
+            arch=args.arch,
         )
